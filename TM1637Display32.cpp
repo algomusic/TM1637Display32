@@ -26,7 +26,7 @@ extern "C" {
 // TM1637 datasheet specifies ~1µs minimum, but we use more for reliability
 // ESP32/RP2040 require longer delays for reliable non-blocking operation
 #if defined(ESP32) || defined(ESP_PLATFORM) || defined(ARDUINO_ARCH_RP2040)
-#define BIT_DELAY_US 100  // Fast MCUs need explicit timing for reliable non-blocking updates
+#define BIT_DELAY_US 50  // Fast MCUs need explicit timing for reliable non-blocking updates
 #else
 #define BIT_DELAY_US 0    // AVR is slow enough that no delay needed
 #endif
@@ -53,12 +53,55 @@ const uint8_t digitToSegment[] = {
 
 static const uint8_t minusSegments = 0b01000000;
 
-TM1637Display::TM1637Display(uint8_t pinClk, uint8_t pinDIO) {
+// Character segment patterns: A-Z (0-25), 0-9 (26-35), space (36), dash (37)
+static const uint8_t charToSegment[] = {
+  SEG_A | SEG_B | SEG_C | SEG_E | SEG_F | SEG_G,         // A
+  SEG_C | SEG_D | SEG_E | SEG_F | SEG_G,                 // b
+  SEG_A | SEG_D | SEG_E | SEG_F,                         // C
+  SEG_B | SEG_C | SEG_D | SEG_E | SEG_G,                 // d
+  SEG_A | SEG_D | SEG_E | SEG_F | SEG_G,                 // E
+  SEG_A | SEG_E | SEG_F | SEG_G,                         // F
+  SEG_A | SEG_C | SEG_D | SEG_E | SEG_F,                 // G
+  SEG_C | SEG_E | SEG_F | SEG_G,                         // h
+  SEG_E | SEG_F,                                         // I
+  SEG_B | SEG_C | SEG_D | SEG_E,                         // J
+  SEG_C | SEG_E | SEG_F | SEG_G,                         // k (same as h)
+  SEG_D | SEG_E | SEG_F,                                 // L
+  SEG_A | SEG_C | SEG_E | SEG_G,                         // M (stylized)
+  SEG_C | SEG_E | SEG_G,                                 // n
+  SEG_A | SEG_B | SEG_C | SEG_D | SEG_E | SEG_F,         // O
+  SEG_A | SEG_B | SEG_E | SEG_F | SEG_G,                 // P
+  SEG_A | SEG_B | SEG_C | SEG_F | SEG_G,                 // q
+  SEG_E | SEG_G,                                         // r
+  SEG_A | SEG_C | SEG_D | SEG_F | SEG_G,                 // S
+  SEG_D | SEG_E | SEG_F | SEG_G,                         // t
+  SEG_B | SEG_C | SEG_D | SEG_E | SEG_F,                 // U
+  SEG_C | SEG_D | SEG_E,                                 // v
+  SEG_B | SEG_D | SEG_F | SEG_G,                         // W (stylized)
+  SEG_B | SEG_C | SEG_E | SEG_F | SEG_G,                 // X (same as H)
+  SEG_B | SEG_C | SEG_D | SEG_F | SEG_G,                 // y
+  SEG_A | SEG_B | SEG_D | SEG_E | SEG_G,                 // Z
+  SEG_A | SEG_B | SEG_C | SEG_D | SEG_E | SEG_F,         // 0
+  SEG_B | SEG_C,                                         // 1
+  SEG_A | SEG_B | SEG_D | SEG_E | SEG_G,                 // 2
+  SEG_A | SEG_B | SEG_C | SEG_D | SEG_G,                 // 3
+  SEG_B | SEG_C | SEG_F | SEG_G,                         // 4
+  SEG_A | SEG_C | SEG_D | SEG_F | SEG_G,                 // 5
+  SEG_A | SEG_C | SEG_D | SEG_E | SEG_F | SEG_G,         // 6
+  SEG_A | SEG_B | SEG_C,                                 // 7
+  SEG_A | SEG_B | SEG_C | SEG_D | SEG_E | SEG_F | SEG_G, // 8
+  SEG_A | SEG_B | SEG_C | SEG_D | SEG_F | SEG_G,         // 9
+  0x00,                                                  // space
+  SEG_G                                                  // dash
+};
+
+TM1637Display32::TM1637Display32(uint8_t pinClk, uint8_t pinDIO) {
   m_pinClk = pinClk;
   m_pinDIO = pinDIO;
   m_brightness = 0x0F;  // Max brightness (7) + display ON (0x08)
   m_counter = 255;  // Idle state (no transmission pending)
   m_lastUpdateMicros = 0;
+  m_transmissionStartMillis = 0;
 
   // Pre-set output latch to LOW (for when we switch to OUTPUT mode)
   digitalWrite(m_pinClk, LOW);
@@ -74,11 +117,14 @@ TM1637Display::TM1637Display(uint8_t pinClk, uint8_t pinDIO) {
   #endif
 }
 
-void TM1637Display::setBrightness(uint8_t brightness, bool on) {
+void TM1637Display32::setBrightness(uint8_t brightness, bool on) {
   m_brightness = (brightness & 0x7) | (on ? 0x08 : 0x00);
 }
 
-void TM1637Display::setSegments(const uint8_t segments[], uint8_t length, uint8_t pos) {
+void TM1637Display32::setSegments(const uint8_t segments[], uint8_t length, uint8_t pos) {
+  // Keep state machine idle during setup to prevent ISR conflicts
+  m_counter = 255;
+
   // Copy segment data
   memset(m_segments, 0, 4);
   if (length > 4) length = 4;
@@ -86,34 +132,58 @@ void TM1637Display::setSegments(const uint8_t segments[], uint8_t length, uint8_
 
   m_pos = pos;
   m_length = length;
-  m_counter = 0;  // Start transmission
-  m_phase = 0;
-  m_bit_count = 0;
-  m_byte = TM1637_I2C_COMM1;
 
-  // Ensure bus is in idle state (both lines HIGH) before starting
-  // This is critical for subsequent transmissions to be recognized
+  // Force a clean stop condition to terminate any in-progress transaction
+  // This prevents the TM1637 from getting stuck waiting for more data
+  // Stop sequence: CLK LOW -> DIO LOW -> CLK HIGH -> DIO HIGH
+  pinMode(m_pinClk, OUTPUT);
+  digitalWrite(m_pinClk, LOW);
+  delayMicroseconds(5);
+  pinMode(m_pinDIO, OUTPUT);
+  digitalWrite(m_pinDIO, LOW);
+  delayMicroseconds(5);
   #if defined(ESP32) || defined(ESP_PLATFORM) || defined(ARDUINO_ARCH_RP2040)
-  pinMode(m_pinDIO, INPUT_PULLUP);  // DIO HIGH first
   pinMode(m_pinClk, INPUT_PULLUP);  // CLK HIGH
   #else
-  pinMode(m_pinDIO, INPUT);
   pinMode(m_pinClk, INPUT);
   #endif
-  delayMicroseconds(50);  // Let bus settle to idle state (increased for reliability)
+  delayMicroseconds(5);
+  #if defined(ESP32) || defined(ESP_PLATFORM) || defined(ARDUINO_ARCH_RP2040)
+  pinMode(m_pinDIO, INPUT_PULLUP);  // DIO HIGH (stop condition)
+  #else
+  pinMode(m_pinDIO, INPUT);
+  #endif
+  delayMicroseconds(1200);  // Datasheet: reset both lines high for >1ms after error
 
   // Start condition: DIO goes LOW while CLK is HIGH
   pinMode(m_pinDIO, OUTPUT);
-  digitalWrite(m_pinDIO, LOW);  // Explicit LOW for ESP32
+  digitalWrite(m_pinDIO, LOW);
   delayMicroseconds(10);  // Let TM1637 recognize start condition
 
   m_lastUpdateMicros = micros();
+  m_transmissionStartMillis = millis();  // For watchdog timeout
+
+  // NOW enable state machine - after all blocking GPIO work is done
+  // This prevents ISR from conflicting with the setup sequence above
+  m_phase = 0;
+  m_bit_count = 0;
+  m_byte = TM1637_I2C_COMM1;
+  m_counter = 0;  // Start transmission (must be last!)
 }
 
-bool TM1637Display::update() {
+bool TM1637Display32::update() {
   // Check if transmission is complete or idle
   if (m_counter == 255) {
     return true;  // No transmission in progress
+  }
+
+  // Watchdog: if transmission takes too long, reset to idle
+  // A complete 4-digit transmission should take ~7ms max at 100µs per step
+  // Allow 50ms as generous timeout for worst-case scenarios
+  unsigned long nowMillis = millis();
+  if ((nowMillis - m_transmissionStartMillis) > 50) {
+    m_counter = 255;  // Force idle - transmission timed out
+    return true;
   }
 
   // Rate limiting: ensure minimum time between state changes
@@ -208,8 +278,12 @@ bool TM1637Display::update() {
   return false;
 }
 
+bool TM1637Display32::isIdle() const {
+  return m_counter == 255;
+}
+
 // Write one bit of m_byte, returns true when byte complete (including ACK)
-bool TM1637Display::writeBit() {
+bool TM1637Display32::writeBit() {
   switch (m_counter) {
     case 0:  // CLK LOW
       pinMode(m_pinClk, OUTPUT);
@@ -280,7 +354,7 @@ bool TM1637Display::writeBit() {
 }
 
 // Generate start condition, returns true when complete
-bool TM1637Display::startCondition() {
+bool TM1637Display32::startCondition() {
   switch (m_counter) {
     case 0:  // Ensure CLK is HIGH
       #if defined(ESP32) || defined(ESP_PLATFORM) || defined(ARDUINO_ARCH_RP2040)
@@ -309,7 +383,7 @@ bool TM1637Display::startCondition() {
 }
 
 // Generate stop condition, returns true when complete
-bool TM1637Display::stopCondition() {
+bool TM1637Display32::stopCondition() {
   switch (m_counter) {
     case 0:  // CLK LOW
       pinMode(m_pinClk, OUTPUT);
@@ -343,28 +417,28 @@ bool TM1637Display::stopCondition() {
   return false;
 }
 
-void TM1637Display::clear() {
+void TM1637Display32::clear() {
   uint8_t data[] = { 0, 0, 0, 0 };
   setSegments(data);
 }
 
-void TM1637Display::showNumberDec(int num, bool leading_zero, uint8_t length, uint8_t pos) {
+void TM1637Display32::showNumberDec(int num, bool leading_zero, uint8_t length, uint8_t pos) {
   showNumberDecEx(num, 0, leading_zero, length, pos);
 }
 
-void TM1637Display::showNumberDecEx(int num, uint8_t dots, bool leading_zero,
+void TM1637Display32::showNumberDecEx(int num, uint8_t dots, bool leading_zero,
                                     uint8_t length, uint8_t pos) {
   showNumberBaseEx(num < 0 ? -10 : 10, num < 0 ? -num : num,
                    dots, leading_zero, length, pos);
 }
 
-void TM1637Display::showNumberHexEx(uint16_t num, uint8_t dots,
+void TM1637Display32::showNumberHexEx(uint16_t num, uint8_t dots,
                                     bool leading_zero, uint8_t length,
                                     uint8_t pos) {
   showNumberBaseEx(16, num, dots, leading_zero, length, pos);
 }
 
-void TM1637Display::showNumberBaseEx(int8_t base, uint16_t num, uint8_t dots,
+void TM1637Display32::showNumberBaseEx(int8_t base, uint16_t num, uint8_t dots,
                                      bool leading_zero, uint8_t length,
                                      uint8_t pos) {
   bool negative = false;
@@ -402,13 +476,64 @@ void TM1637Display::showNumberBaseEx(int8_t base, uint16_t num, uint8_t dots,
   setSegments(digits, length, pos);
 }
 
-void TM1637Display::showDots(uint8_t dots, uint8_t* digits) {
+void TM1637Display32::showDots(uint8_t dots, uint8_t* digits) {
   for (int i = 0; i < 4; ++i) {
     digits[i] |= (dots & 0x80);
     dots <<= 1;
   }
 }
 
-uint8_t TM1637Display::encodeDigit(uint8_t digit) {
+uint8_t TM1637Display32::encodeDigit(uint8_t digit) {
   return digitToSegment[digit & 0x0f];
+}
+
+uint8_t TM1637Display32::charToSeg(char c) {
+  if (c >= 'A' && c <= 'Z') return charToSegment[c - 'A'];
+  if (c >= 'a' && c <= 'z') return charToSegment[c - 'a'];
+  if (c >= '0' && c <= '9') return charToSegment[26 + (c - '0')];
+  if (c == ' ') return charToSegment[36];
+  if (c == '-') return charToSegment[37];
+  return 0x00;  // unknown character = blank
+}
+
+void TM1637Display32::displayText(const char* text, uint8_t pos) {
+  uint8_t segs[4] = {0, 0, 0, 0};
+  int maxLen = 4 - pos;
+  int textLen = strlen(text);
+  int len = (maxLen < textLen) ? maxLen : textLen;
+  for (int i = 0; i < len; i++) {
+    segs[pos + i] = charToSeg(text[i]);
+  }
+  setSegments(segs);
+}
+
+void TM1637Display32::displayCharAndNumber(char c, int number) {
+  uint8_t segs[4];
+  segs[0] = charToSeg(c);
+
+  // Format number for 3 digits (positions 1-3)
+  int absNum = abs(number);
+  if (absNum >= 10000) {
+    // 10000+: show as XX.X (e.g., 12300 -> "12.3")
+    absNum = absNum / 100;
+    segs[1] = encodeDigit((absNum / 100) % 10);
+    segs[2] = encodeDigit((absNum / 10) % 10) | SEG_DP;
+    segs[3] = encodeDigit(absNum % 10);
+  } else if (absNum >= 1000) {
+    // 1000-9999: show as X.XK (e.g., 1024 -> "1.0K", 5678 -> "5.6K")
+    absNum = absNum / 100;  // Get first two significant digits
+    segs[1] = encodeDigit((absNum / 10) % 10) | SEG_DP;
+    segs[2] = encodeDigit(absNum % 10);
+    segs[3] = charToSeg('K');
+  } else {
+    // 0-999: show as is, right-aligned, blank leading zeros
+    segs[1] = (absNum >= 100) ? encodeDigit((absNum / 100) % 10) : 0;
+    segs[2] = (absNum >= 10) ? encodeDigit((absNum / 10) % 10) : 0;
+    segs[3] = encodeDigit(absNum % 10);
+    // Handle negative
+    if (number < 0 && absNum < 100) {
+      segs[1] = SEG_G;  // Minus sign
+    }
+  }
+  setSegments(segs, 4, 0);
 }
