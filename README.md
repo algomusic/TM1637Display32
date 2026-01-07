@@ -19,3 +19,4 @@ New additions:
   - displayText(text, pos) - text display
   - displayCharAndNumber(c, number) - combined display
   - isIdle() - for use in main loop when using timer ISR for display update()
+  - startScrolling() - text longer than 4 chars can move left to right acorss the display
