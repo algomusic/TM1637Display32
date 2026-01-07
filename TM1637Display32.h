@@ -80,6 +80,22 @@ public:
   //! Numbers >= 10000 show as XX.X (e.g., 12300 -> "12.3")
   void displayCharAndNumber(char c, int number);
 
+  //! Start scrolling text across the display
+  //! @param text The text to scroll (will be padded with spaces)
+  //! @param interval_ms Milliseconds between scroll steps (default 300)
+  //! @param pad_spaces Spaces to add at start and end for smooth scroll (default 4)
+  void startScroll(const char* text, uint16_t interval_ms = 300, uint8_t pad_spaces = 4);
+
+  //! Update scrolling - call from loop()
+  //! @return true when scrolling is complete, false if still scrolling
+  bool updateScroll();
+
+  //! Check if currently scrolling
+  bool isScrolling() const;
+
+  //! Stop scrolling immediately
+  void stopScroll();
+
 protected:
   void showDots(uint8_t dots, uint8_t* digits);
   void showNumberBaseEx(int8_t base, uint16_t num, uint8_t dots = 0,
@@ -112,6 +128,14 @@ private:
   bool writeBit();          // Write one bit, returns true when byte complete
   bool startCondition();    // Generate start, returns true when complete
   bool stopCondition();     // Generate stop, returns true when complete
+
+  // Scrolling state
+  char m_scrollBuffer[32];        // Buffer for padded scroll text (max 24 chars + padding)
+  uint8_t m_scrollLength;         // Length of text in buffer
+  uint8_t m_scrollPos;            // Current scroll position
+  uint16_t m_scrollInterval;      // Ms between scroll steps
+  unsigned long m_scrollLastStep; // Time of last scroll step
+  bool m_scrollActive;            // Whether scrolling is active
 };
 
 #endif // __TM1637DISPLAY32__

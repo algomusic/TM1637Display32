@@ -102,6 +102,9 @@ TM1637Display32::TM1637Display32(uint8_t pinClk, uint8_t pinDIO) {
   m_counter = 255;  // Idle state (no transmission pending)
   m_lastUpdateMicros = 0;
   m_transmissionStartMillis = 0;
+  m_scrollActive = false;
+  m_scrollLength = 0;
+  m_scrollPos = 0;
 
   // Pre-set output latch to LOW (for when we switch to OUTPUT mode)
   digitalWrite(m_pinClk, LOW);
@@ -536,4 +539,68 @@ void TM1637Display32::displayCharAndNumber(char c, int number) {
     }
   }
   setSegments(segs, 4, 0);
+}
+
+void TM1637Display32::startScroll(const char* text, uint16_t interval_ms, uint8_t pad_spaces) {
+  // Build padded buffer: spaces + text + spaces
+  uint8_t textLen = strlen(text);
+  if (textLen > 24) textLen = 24;  // Limit text length
+
+  // Fill with leading spaces
+  uint8_t pos = 0;
+  for (uint8_t i = 0; i < pad_spaces && pos < 31; i++) {
+    m_scrollBuffer[pos++] = ' ';
+  }
+
+  // Copy text
+  for (uint8_t i = 0; i < textLen && pos < 31; i++) {
+    m_scrollBuffer[pos++] = text[i];
+  }
+
+  // Add trailing spaces
+  for (uint8_t i = 0; i < pad_spaces && pos < 31; i++) {
+    m_scrollBuffer[pos++] = ' ';
+  }
+
+  m_scrollBuffer[pos] = '\0';
+  m_scrollLength = pos;
+  m_scrollPos = 0;
+  m_scrollInterval = interval_ms;
+  m_scrollLastStep = millis();
+  m_scrollActive = true;
+
+  // Display first frame
+  displayText(m_scrollBuffer, 0);
+}
+
+bool TM1637Display32::updateScroll() {
+  if (!m_scrollActive) return true;
+
+  // Check if display is ready for next update
+  if (!isIdle()) return false;
+
+  // Check if it's time for next scroll step
+  unsigned long now = millis();
+  if ((now - m_scrollLastStep) < m_scrollInterval) return false;
+
+  m_scrollLastStep = now;
+  m_scrollPos++;
+
+  // Check if scroll is complete
+  if (m_scrollPos + 4 > m_scrollLength) {
+    m_scrollActive = false;
+    return true;
+  }
+
+  // Display current window
+  displayText(&m_scrollBuffer[m_scrollPos], 0);
+  return false;
+}
+
+bool TM1637Display32::isScrolling() const {
+  return m_scrollActive;
+}
+
+void TM1637Display32::stopScroll() {
+  m_scrollActive = false;
 }
