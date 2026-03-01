@@ -41,6 +41,24 @@ public:
   //! @return true if idle, false if busy
   bool isIdle() const;
 
+  //! Pump the state machine until transmission completes or timeout.
+  //! Use this in loop()-based (non-ISR) projects to drive the display.
+  //! Respects internal BIT_DELAY rate limiting between steps.
+  //! @param timeout_us Maximum time to pump in microseconds (default 25000 = 25ms)
+  //! @return true if idle (complete or no transmission), false if timed out
+  bool pump(unsigned long timeout_us = 25000);
+
+  //! Set minimum interval between display transmissions (for polled mode).
+  //! Prevents rapid updates (e.g., from turning a dial) from blocking the main loop.
+  //! @param interval_ms Minimum milliseconds between transmissions (0 = no throttle)
+  void setMinInterval(unsigned long interval_ms);
+
+  //! Check if the display is ready to accept new content.
+  //! Returns true only if idle AND the minimum interval has elapsed since
+  //! the last transmission started. Use instead of isIdle() when throttling.
+  //! @return true if ready for new content
+  bool isReadyForUpdate();
+
   //! Sets the brightness (takes effect on next setSegments call)
   //! @param brightness 0-7 (lowest to highest)
   //! @param on Turn display on or off
@@ -123,6 +141,8 @@ private:
   // Timing for rate limiting and watchdog
   unsigned long m_lastUpdateMicros;
   unsigned long m_transmissionStartMillis;  // For timeout detection
+  unsigned long m_lastTransmissionMillis;   // For update throttling
+  unsigned long m_minIntervalMillis;        // Minimum ms between transmissions (0 = no throttle)
 
   // Internal protocol helpers
   bool writeBit();          // Write one bit, returns true when byte complete

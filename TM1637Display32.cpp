@@ -26,7 +26,7 @@ extern "C" {
 // TM1637 datasheet specifies ~1µs minimum, but we use more for reliability
 // ESP32/RP2040 require longer delays for reliable non-blocking operation
 #if defined(ESP32) || defined(ESP_PLATFORM) || defined(ARDUINO_ARCH_RP2040)
-#define BIT_DELAY_US 50  // Fast MCUs need explicit timing for reliable non-blocking updates
+#define BIT_DELAY_US 100  // Matches proven 10kHz ISR timing; gives margin for RTOS preemption
 #else
 #define BIT_DELAY_US 0    // AVR is slow enough that no delay needed
 #endif
@@ -102,6 +102,8 @@ TM1637Display32::TM1637Display32(uint8_t pinClk, uint8_t pinDIO) {
   m_counter = 255;  // Idle state (no transmission pending)
   m_lastUpdateMicros = 0;
   m_transmissionStartMillis = 0;
+  m_lastTransmissionMillis = 0;
+  m_minIntervalMillis = 0;  // No throttle by default
   m_scrollActive = false;
   m_scrollLength = 0;
   m_scrollPos = 0;
@@ -165,6 +167,7 @@ void TM1637Display32::setSegments(const uint8_t segments[], uint8_t length, uint
 
   m_lastUpdateMicros = micros();
   m_transmissionStartMillis = millis();  // For watchdog timeout
+  m_lastTransmissionMillis = m_transmissionStartMillis;  // For update throttling
 
   // NOW enable state machine - after all blocking GPIO work is done
   // This prevents ISR from conflicting with the setup sequence above
@@ -181,10 +184,11 @@ bool TM1637Display32::update() {
   }
 
   // Watchdog: if transmission takes too long, reset to idle
-  // A complete 4-digit transmission should take ~7ms max at 100µs per step
-  // Allow 50ms as generous timeout for worst-case scenarios
+  // When driven by ISR at 10kHz, a transmission takes ~20ms.
+  // When polled from loop(), it can take 50-150ms depending on loop load.
+  // Allow 500ms as generous timeout to avoid aborting valid transmissions.
   unsigned long nowMillis = millis();
-  if ((nowMillis - m_transmissionStartMillis) > 50) {
+  if ((nowMillis - m_transmissionStartMillis) > 500) {
     m_counter = 255;  // Force idle - transmission timed out
     return true;
   }
@@ -283,6 +287,24 @@ bool TM1637Display32::update() {
 
 bool TM1637Display32::isIdle() const {
   return m_counter == 255;
+}
+
+bool TM1637Display32::pump(unsigned long timeout_us) {
+  unsigned long start = micros();
+  while ((micros() - start) < timeout_us) {
+    if (update()) return true;  // idle or complete
+  }
+  return false;  // timed out, transmission still in progress
+}
+
+void TM1637Display32::setMinInterval(unsigned long interval_ms) {
+  m_minIntervalMillis = interval_ms;
+}
+
+bool TM1637Display32::isReadyForUpdate() {
+  if (!isIdle()) return false;
+  if (m_minIntervalMillis == 0) return true;
+  return (millis() - m_lastTransmissionMillis) >= m_minIntervalMillis;
 }
 
 // Write one bit of m_byte, returns true when byte complete (including ACK)
