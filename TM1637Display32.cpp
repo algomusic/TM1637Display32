@@ -127,6 +127,9 @@ void TM1637Display32::setBrightness(uint8_t brightness, bool on) {
 }
 
 void TM1637Display32::setSegments(const uint8_t segments[], uint8_t length, uint8_t pos) {
+  // Was the state machine already idle? If so, skip the heavy bus reset.
+  bool wasIdle = (m_counter == 255);
+
   // Keep state machine idle during setup to prevent ISR conflicts
   m_counter = 255;
 
@@ -138,27 +141,39 @@ void TM1637Display32::setSegments(const uint8_t segments[], uint8_t length, uint
   m_pos = pos;
   m_length = length;
 
-  // Force a clean stop condition to terminate any in-progress transaction
-  // This prevents the TM1637 from getting stuck waiting for more data
-  // Stop sequence: CLK LOW -> DIO LOW -> CLK HIGH -> DIO HIGH
-  pinMode(m_pinClk, OUTPUT);
-  digitalWrite(m_pinClk, LOW);
-  delayMicroseconds(5);
-  pinMode(m_pinDIO, OUTPUT);
-  digitalWrite(m_pinDIO, LOW);
-  delayMicroseconds(5);
-  #if defined(ESP32) || defined(ESP_PLATFORM) || defined(ARDUINO_ARCH_RP2040)
-  pinMode(m_pinClk, INPUT_PULLUP);  // CLK HIGH
-  #else
-  pinMode(m_pinClk, INPUT);
-  #endif
-  delayMicroseconds(5);
-  #if defined(ESP32) || defined(ESP_PLATFORM) || defined(ARDUINO_ARCH_RP2040)
-  pinMode(m_pinDIO, INPUT_PULLUP);  // DIO HIGH (stop condition)
-  #else
-  pinMode(m_pinDIO, INPUT);
-  #endif
-  delayMicroseconds(1200);  // Datasheet: reset both lines high for >1ms after error
+  if (wasIdle) {
+    // Bus is in a known-good state (both lines HIGH from previous stop condition).
+    // Just ensure lines are HIGH then issue START — no reset needed.
+    #if defined(ESP32) || defined(ESP_PLATFORM) || defined(ARDUINO_ARCH_RP2040)
+    pinMode(m_pinClk, INPUT_PULLUP);
+    pinMode(m_pinDIO, INPUT_PULLUP);
+    #else
+    pinMode(m_pinClk, INPUT);
+    pinMode(m_pinDIO, INPUT);
+    #endif
+    delayMicroseconds(5);
+  } else {
+    // Mid-transaction abort: force a clean stop to reset the TM1637
+    // Stop sequence: CLK LOW -> DIO LOW -> CLK HIGH -> DIO HIGH
+    pinMode(m_pinClk, OUTPUT);
+    digitalWrite(m_pinClk, LOW);
+    delayMicroseconds(5);
+    pinMode(m_pinDIO, OUTPUT);
+    digitalWrite(m_pinDIO, LOW);
+    delayMicroseconds(5);
+    #if defined(ESP32) || defined(ESP_PLATFORM) || defined(ARDUINO_ARCH_RP2040)
+    pinMode(m_pinClk, INPUT_PULLUP);  // CLK HIGH
+    #else
+    pinMode(m_pinClk, INPUT);
+    #endif
+    delayMicroseconds(5);
+    #if defined(ESP32) || defined(ESP_PLATFORM) || defined(ARDUINO_ARCH_RP2040)
+    pinMode(m_pinDIO, INPUT_PULLUP);  // DIO HIGH (stop condition)
+    #else
+    pinMode(m_pinDIO, INPUT);
+    #endif
+    delayMicroseconds(1200);  // Datasheet: reset both lines high for >1ms after error
+  }
 
   // Start condition: DIO goes LOW while CLK is HIGH
   pinMode(m_pinDIO, OUTPUT);
